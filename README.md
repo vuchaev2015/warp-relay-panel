@@ -1,4 +1,4 @@
-# WARP Relay Panel v2
+# WARP Relay Panel v1.0.1
 
 Панель управления whitelist для WARP Relay серверов.
 Бесплатный хостинг на **Vercel + Supabase**.
