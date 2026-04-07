@@ -26,30 +26,35 @@ AGENT_PORT=${AGENT_PORT:-7580}
 
 INSTALL_DIR="/opt/warp-relay-agent"
 TAG="WR_RULE"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # ═══════════════════════════════════════
 # 1. СИСТЕМНЫЕ ПАКЕТЫ
 # ═══════════════════════════════════════
 
 echo ""
-echo -e "${Y}[1/6] Установка пакетов...${N}"
+echo -e "${Y}[1/7] Установка пакетов...${N}"
 export DEBIAN_FRONTEND=noninteractive
 apt update -qq
-apt install -y -qq iptables ipset curl conntrack netfilter-persistent ipset-persistent python3 python3-pip python3-venv
+apt install -y -qq iptables ipset curl conntrack netfilter-persistent ipset-persistent python3 python3-pip python3-venv git
 
 # ═══════════════════════════════════════
 # 2. IP FORWARD
 # ═══════════════════════════════════════
 
-echo -e "${Y}[2/6] Включаем ip_forward...${N}"
+echo -e "${Y}[2/7] Включаем ip_forward...${N}"
 echo "net.ipv4.ip_forward=1" > /etc/sysctl.d/ipv4-forwarding.conf
 sysctl -w net.ipv4.ip_forward=1 >/dev/null
+
+# Включаем conntrack accounting для подсчёта трафика
+echo "net.netfilter.nf_conntrack_acct=1" > /etc/sysctl.d/conntrack-acct.conf
+sysctl -w net.netfilter.nf_conntrack_acct=1 >/dev/null 2>&1 || true
 
 # ═══════════════════════════════════════
 # 3. IPSET
 # ═══════════════════════════════════════
 
-echo -e "${Y}[3/6] Создаём ipset warp_whitelist...${N}"
+echo -e "${Y}[3/7] Создаём ipset warp_whitelist...${N}"
 ipset destroy warp_whitelist 2>/dev/null || true
 ipset create warp_whitelist hash:ip
 echo -e "${G}  ipset создан${N}"
@@ -58,7 +63,7 @@ echo -e "${G}  ipset создан${N}"
 # 4. IPTABLES — NAT + WHITELIST FORWARD
 # ═══════════════════════════════════════
 
-echo -e "${Y}[4/6] Настраиваем iptables...${N}"
+echo -e "${Y}[4/7] Настраиваем iptables...${N}"
 
 SRC_IP=$(curl -4s ifconfig.me)
 DST_IP=$(getent ahostsv4 engage.cloudflareclient.com | awk '{print $1; exit}')
@@ -135,15 +140,14 @@ systemctl daemon-reload
 systemctl enable ipset-restore.service
 
 # ═══════════════════════════════════════
-# 5. RELAY AGENT
+# 5. RELAY AGENT — файлы
 # ═══════════════════════════════════════
 
-echo -e "${Y}[5/6] Устанавливаем relay-agent...${N}"
+echo -e "${Y}[5/7] Устанавливаем relay-agent...${N}"
 
 mkdir -p ${INSTALL_DIR}
 
-# Копируем agent.py если он рядом
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# Копируем файлы агента
 if [ -f "${SCRIPT_DIR}/agent.py" ]; then
     cp "${SCRIPT_DIR}/agent.py" ${INSTALL_DIR}/
     cp "${SCRIPT_DIR}/requirements.txt" ${INSTALL_DIR}/ 2>/dev/null || true
@@ -151,6 +155,30 @@ if [ -f "${SCRIPT_DIR}/agent.py" ]; then
 else
     echo -e "${R}  agent.py не найден рядом со скриптом!${N}"
     echo -e "  Скопируйте agent.py в ${INSTALL_DIR}/ вручную"
+fi
+
+# Копируем ensure_rules.sh
+if [ -f "${SCRIPT_DIR}/ensure_rules.sh" ]; then
+    cp "${SCRIPT_DIR}/ensure_rules.sh" ${INSTALL_DIR}/
+    chmod +x ${INSTALL_DIR}/ensure_rules.sh
+    echo -e "${G}  ensure_rules.sh скопирован${N}"
+else
+    # Создаём минимальный ensure_rules.sh если нет в репо
+    cat > ${INSTALL_DIR}/ensure_rules.sh << 'ENSURE_EOF'
+#!/bin/bash
+IPSET_NAME="${IPSET_NAME:-warp_whitelist}"
+if ! ipset list "$IPSET_NAME" &>/dev/null; then
+    [ -f /etc/ipset.rules ] && ipset restore -f /etc/ipset.rules 2>/dev/null
+    ipset list "$IPSET_NAME" &>/dev/null || ipset create "$IPSET_NAME" hash:ip 2>/dev/null
+fi
+if ! iptables -t nat -S 2>/dev/null | grep -q "WR_RULE"; then
+    command -v netfilter-persistent &>/dev/null && netfilter-persistent reload 2>/dev/null
+fi
+FWD=$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)
+[ "$FWD" != "1" ] && sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
+ENSURE_EOF
+    chmod +x ${INSTALL_DIR}/ensure_rules.sh
+    echo -e "${G}  ensure_rules.sh создан${N}"
 fi
 
 # Python venv
@@ -170,16 +198,17 @@ echo -e "${G}  venv и .env созданы${N}"
 # 6. SYSTEMD SERVICE
 # ═══════════════════════════════════════
 
-echo -e "${Y}[6/6] Настраиваем systemd...${N}"
+echo -e "${Y}[6/7] Настраиваем systemd...${N}"
 
 cat > /etc/systemd/system/warp-relay-agent.service << EOF
 [Unit]
 Description=WARP Relay Agent
-After=network.target
+After=network.target ipset-restore.service netfilter-persistent.service
 
 [Service]
 Type=simple
 WorkingDirectory=${INSTALL_DIR}
+ExecStartPre=/bin/bash ${INSTALL_DIR}/ensure_rules.sh
 ExecStart=${INSTALL_DIR}/venv/bin/python3 ${INSTALL_DIR}/agent.py
 Restart=always
 RestartSec=5
@@ -201,6 +230,21 @@ else
 fi
 
 # ═══════════════════════════════════════
+# 7. UPDATE SCRIPT
+# ═══════════════════════════════════════
+
+echo -e "${Y}[7/7] Настраиваем обновления...${N}"
+
+# Копируем update.sh если есть
+if [ -f "${SCRIPT_DIR}/update.sh" ]; then
+    cp "${SCRIPT_DIR}/update.sh" ${INSTALL_DIR}/update.sh
+    chmod +x ${INSTALL_DIR}/update.sh
+    # Симлинк для удобства
+    ln -sf ${INSTALL_DIR}/update.sh /usr/local/bin/warp-update
+    echo -e "${G}  update.sh установлен (также доступен как 'warp-update')${N}"
+fi
+
+# ═══════════════════════════════════════
 # ИТОГ
 # ═══════════════════════════════════════
 
@@ -219,6 +263,9 @@ echo -e "  curl http://localhost:${AGENT_PORT}/health"
 echo -e "  ipset list warp_whitelist"
 echo -e "  systemctl status warp-relay-agent"
 echo ""
+echo -e "  ${Y}Обновление:${N}"
+echo -e "  warp-update  (или bash ${INSTALL_DIR}/update.sh)"
+echo ""
 echo -e "  ${Y}Добавить в панель:${N}"
-echo -e "  POST /api/relays {\"name\": \"$(hostname)\", \"host\": \"${SRC_IP}\", \"agent_port\": ${AGENT_PORT}, \"agent_secret\": \"...\"}"
+echo -e "  POST /api/relays {\"name\": \"$(hostname)\", \"host\": \"${SRC_IP}\", \"agent_port\": ${AGENT_PORT}}"
 echo ""
