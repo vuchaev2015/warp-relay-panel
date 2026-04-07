@@ -1,6 +1,4 @@
 """
-WARP Relay Panel — Vercel Serverless API
-
 Публичные:
   GET  /activate/{token}         — активация клиента
 
@@ -8,6 +6,7 @@ WARP Relay Panel — Vercel Serverless API
   POST/GET/DELETE  /api/clients
   POST/GET/DELETE  /api/relays
   POST             /api/relays/sync-all
+  GET              /api/traffic
   GET              /api/stats
 """
 
@@ -25,6 +24,7 @@ from .database import (
     create_client_record, get_client_by_token, get_client_by_id,
     list_clients, activate_client, block_client, delete_client,
     get_activation_logs, get_all_active_ips,
+    count_clients_on_ip,
     add_relay, list_relays, get_active_relays, delete_relay, toggle_relay,
 )
 from . import relay_client
@@ -32,7 +32,7 @@ from . import relay_client
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
 logger = logging.getLogger("panel")
 
-version = "1.0.1"
+version = "1.1.0"
 app = FastAPI(title="WARP Relay Panel", version=version)
 
 
@@ -49,9 +49,6 @@ def require_api_key(x_api_key: str = Header(...)):
 # BOT DETECTION
 # ═══════════════════════════════════════
 
-# Паттерны User-Agent известных ботов/краулеров, которые
-# делают запросы для генерации превью ссылок (Telegram, WhatsApp,
-# Discord, Twitter/X, Slack, Facebook и т.д.)
 _BOT_PATTERNS = re.compile(
     r"(TelegramBot|TwitterBot|Twitterbot|facebookexternalhit|"
     r"Facebot|WhatsApp|Slackbot|slack-imgproxy|LinkedInBot|"
@@ -63,9 +60,8 @@ _BOT_PATTERNS = re.compile(
 
 
 def _is_bot(user_agent: str) -> bool:
-    """Определяет, является ли запрос от бота/краулера."""
     if not user_agent:
-        return True  # Нет UA — скорее всего не браузер
+        return True
     return bool(_BOT_PATTERNS.search(user_agent))
 
 
@@ -147,8 +143,6 @@ TMPL_ERROR = """<!DOCTYPE html>
   <p class="hint">Обратитесь к администратору.</p>
 </div></body></html>"""
 
-# Минимальная страница-заглушка для ботов: отдаём OG-мета для красивого
-# превью, но без активации. Можно настроить текст/картинку.
 TMPL_BOT = """<!DOCTYPE html>
 <html lang="ru"><head><meta charset="utf-8">
 <meta property="og:title" content="WARP Relay — Активация">
@@ -181,23 +175,18 @@ def _error_html(key: str, status: int = 403) -> HTMLResponse:
 
 @app.get("/activate/{token}")
 async def activate(token: str, request: Request):
-    """Клиент переходит по этой ссылке из Telegram-бота."""
-
     user_agent = request.headers.get("User-Agent", "")
 
-    # ── Блокируем ботов (Telegram preview, Twitter cards и т.д.) ──
     if _is_bot(user_agent):
         logger.info("Bot blocked: token=%s...%s ua=%s", token[:6], token[-4:], user_agent[:80])
         return HTMLResponse(TMPL_BOT, status_code=200)
 
-    # Определяем реальный IP
     client_ip = (
         request.headers.get("X-Real-IP")
         or request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
         or request.client.host
     )
 
-    # Валидация IPv4
     try:
         addr = ipaddress.ip_address(client_ip)
         if isinstance(addr, ipaddress.IPv6Address):
@@ -212,22 +201,26 @@ async def activate(token: str, request: Request):
 
     logger.info("Activate: token=%s...%s ip=%s", token[:6], token[-4:], client_ip)
 
-    # Активация в БД
     result = activate_client(token, client_ip, user_agent)
 
     if "error" in result:
         return _error_html(result["error"])
 
-    # Уже активен с этим IP
     if result["status"] == "already_active":
         return HTMLResponse(TMPL_SAME.format(style=_BASE_STYLE, ip=client_ip))
 
-    # IP изменился — обновляем relay
     old_ip = result.get("old_ip")
     new_ip = result["new_ip"]
-    logger.info("Client #%d: %s → %s", result["client_id"], old_ip or "new", new_ip)
+    cid = result["client_id"]
 
-    relay_results = await relay_client.add_ip(new_ip, old_ip)
+    # Если old_ip используется другими клиентами — НЕ удаляем с relay
+    if result.get("old_ip_shared"):
+        logger.info("Client #%d: %s → %s (old IP shared, keeping)", cid, old_ip, new_ip)
+        old_ip = None  # не передаём на удаление
+    else:
+        logger.info("Client #%d: %s → %s", cid, old_ip or "new", new_ip)
+
+    relay_results = await relay_client.add_ip(new_ip, old_ip, client_id=cid)
     logger.info("Relay sync: %s", relay_results)
 
     return HTMLResponse(TMPL_SUCCESS.format(style=_BASE_STYLE, ip=client_ip))
@@ -245,7 +238,6 @@ async def api_create_client(data: ClientCreate):
 @app.get("/api/clients", dependencies=[Depends(require_api_key)])
 async def api_list_clients(include_blocked: bool = True):
     clients = list_clients(include_blocked=include_blocked)
-    # Убираем приватные поля
     for c in clients:
         c.pop("_activations_today", None)
         c.pop("_reset_date", None)
@@ -272,6 +264,25 @@ async def api_client_logs(client_id: int, limit: int = 50):
     return {"client_id": client_id, "label": client["label"], "logs": logs}
 
 
+@app.get("/api/clients/{client_id}/traffic", dependencies=[Depends(require_api_key)])
+async def api_client_traffic(client_id: int):
+    """Трафик клиента по его текущему IP со всех relay."""
+    client = get_client_by_id(client_id)
+    if not client:
+        raise HTTPException(404, "Client not found")
+    if not client["current_ip"]:
+        return {"client_id": client_id, "label": client["label"],
+                "ip": None, "relays": {}, "note": "No active IP"}
+
+    results = await relay_client.get_traffic_all_relays(client["current_ip"])
+    return {
+        "client_id": client_id,
+        "label": client["label"],
+        "ip": client["current_ip"],
+        "relays": results,
+    }
+
+
 @app.patch("/api/clients/{client_id}/block", dependencies=[Depends(require_api_key)])
 async def api_block_client(client_id: int, data: ClientBlock):
     client = get_client_by_id(client_id)
@@ -280,9 +291,14 @@ async def api_block_client(client_id: int, data: ClientBlock):
 
     block_client(client_id, data.blocked)
 
-    # Блокировка → удаляем IP с relay
+    # Блокировка → удаляем IP с relay ТОЛЬКО если никто другой не использует
     if data.blocked and client["current_ip"]:
-        await relay_client.remove_ip(client["current_ip"])
+        others = count_clients_on_ip(client["current_ip"], exclude_client_id=client_id)
+        if others == 0:
+            await relay_client.remove_ip(client["current_ip"])
+        else:
+            logger.info("Block client #%d: IP %s shared by %d others, keeping",
+                        client_id, client["current_ip"], others)
 
     return {"id": client_id, "is_blocked": data.blocked}
 
@@ -293,8 +309,15 @@ async def api_delete_client(client_id: int):
     if not client:
         raise HTTPException(404, "Client not found")
 
+    # Удаляем IP с relay ТОЛЬКО если никто другой не использует
     if client["current_ip"]:
-        await relay_client.remove_ip(client["current_ip"])
+        # После удаления клиента — проверяем оставшихся
+        others = count_clients_on_ip(client["current_ip"])
+        if others == 0:
+            await relay_client.remove_ip(client["current_ip"])
+        else:
+            logger.info("Delete client #%d: IP %s shared by %d others, keeping",
+                        client_id, client["current_ip"], others)
 
     return {"deleted": True, "id": client_id}
 
@@ -348,6 +371,16 @@ async def api_relay_stats(relay_id: int):
     return await relay_client.get_relay_stats(relay)
 
 
+@app.get("/api/relays/{relay_id}/traffic", dependencies=[Depends(require_api_key)])
+async def api_relay_traffic(relay_id: int):
+    """Трафик всех IP на конкретном relay."""
+    relays = list_relays()
+    relay = next((r for r in relays if r["id"] == relay_id), None)
+    if not relay:
+        raise HTTPException(404, "Relay not found")
+    return await relay_client.get_relay_traffic(relay)
+
+
 @app.post("/api/relays/{relay_id}/sync", dependencies=[Depends(require_api_key)])
 async def api_sync_relay(relay_id: int):
     return await relay_client.full_sync(relay_id=relay_id)
@@ -361,6 +394,16 @@ async def api_sync_all():
 @app.get("/api/relays/health-all", dependencies=[Depends(require_api_key)])
 async def api_health_all():
     return await relay_client.health_check_all()
+
+
+# ═══════════════════════════════════════
+# API: ТРАФИК (агрегированный)
+# ═══════════════════════════════════════
+
+@app.get("/api/traffic", dependencies=[Depends(require_api_key)])
+async def api_traffic_all():
+    """Трафик со всех relay (по IP, для админского анализа)."""
+    return await relay_client.get_traffic_all_relays()
 
 
 # ═══════════════════════════════════════

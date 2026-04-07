@@ -58,6 +58,24 @@ def list_clients(include_blocked: bool = True) -> list[dict]:
     return [_decrypt_client(r) for r in result.data]
 
 
+def count_clients_on_ip(ip: str, exclude_client_id: int | None = None) -> int:
+    """
+    Сколько ДРУГИХ незаблокированных клиентов сидят на этом IP.
+    Используется для защиты от удаления общего IP.
+    """
+    ip_hash = hash_ip(ip)
+    query = (
+        _db().table("clients")
+        .select("id", count="exact")
+        .eq("current_ip_hash", ip_hash)
+        .eq("is_blocked", False)
+    )
+    if exclude_client_id is not None:
+        query = query.neq("id", exclude_client_id)
+    result = query.execute()
+    return result.count or 0
+
+
 def activate_client(token: str, new_ip: str, user_agent: str = "") -> dict:
     """Главная логика активации: проверки + обновление IP."""
     client = get_client_by_token(token)
@@ -83,6 +101,13 @@ def activate_client(token: str, new_ip: str, user_agent: str = "") -> dict:
     if old_ip == new_ip:
         return {"status": "already_active", "client_id": client["id"], "new_ip": new_ip}
 
+    # Проверяем: есть ли ещё кто-то на old_ip?
+    # Если да — не передаём old_ip на удаление с relay
+    old_ip_shared = False
+    if old_ip:
+        others = count_clients_on_ip(old_ip, exclude_client_id=client["id"])
+        old_ip_shared = others > 0
+
     # Обновляем клиента
     now = datetime.now(timezone.utc).isoformat()
     update_data = {
@@ -107,6 +132,7 @@ def activate_client(token: str, new_ip: str, user_agent: str = "") -> dict:
         "client_id": client["id"],
         "old_ip": old_ip,
         "new_ip": new_ip,
+        "old_ip_shared": old_ip_shared,
     }
 
 
