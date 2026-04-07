@@ -9,6 +9,7 @@ import asyncio
 import json
 import os
 import re
+import signal
 import subprocess
 import time
 import logging
@@ -85,6 +86,29 @@ def _run(cmd: str, check: bool = False, timeout: int = 10) -> tuple[int, str, st
     if check and result.returncode != 0:
         raise RuntimeError(f"Command failed: {cmd}\n{result.stderr}")
     return result.returncode, result.stdout.strip(), result.stderr.strip()
+
+
+def _run_killgroup(cmd: str, timeout: int = 30) -> tuple[int, str, str]:
+    """
+    Запуск команды в отдельной process group.
+    При таймауте убивает ВСЮ группу (включая дочерние git-remote-https).
+    """
+    proc = subprocess.Popen(
+        cmd, shell=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+        return proc.returncode, stdout.strip(), stderr.strip()
+    except subprocess.TimeoutExpired:
+        # Убиваем всю group — никаких зомби
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        proc.wait()
+        return -1, "", f"Timed out after {timeout}s"
 
 
 def _format_bytes(b: int) -> str:
@@ -487,7 +511,7 @@ async def refcount_list():
 
 
 # ═══════════════════════════════════════
-# SELF-UPDATE (fire-and-forget)
+# SELF-UPDATE (fire-and-forget, runs in thread)
 # ═══════════════════════════════════════
 
 def _load_update_status() -> dict | None:
@@ -505,30 +529,45 @@ def _save_update_status(status: dict):
         logger.error("Could not save update status: %s", e)
 
 
-async def _do_update():
-    """Фоновая задача обновления."""
+def _do_update_sync():
+    """
+    Синхронная функция обновления. Запускается в отдельном потоке
+    через run_in_executor, чтобы не блокировать event loop.
+    Использует _run_killgroup для git — убивает всю process group при таймауте.
+    """
     repo = str(REPO_DIR)
     install = str(DATA_DIR)
     agent_src = f"{repo}/relay-agent"
     started_at = _now_msk().isoformat()
 
     try:
-        # ── Git pull ──
-        code, stdout, stderr = _run(f"cd {repo} && git pull --ff-only 2>&1", timeout=30)
-        if code != 0:
-            code, stdout, stderr = _run(f"cd {repo} && git pull 2>&1", timeout=30)
+        # Чистим git lock если остался от предыдущего зависшего pull
+        lock_file = REPO_DIR / ".git" / "index.lock"
+        if lock_file.exists():
+            lock_file.unlink()
+            logger.warning("Removed stale git lock: %s", lock_file)
+
+        # ── Git pull (с убийством всей group при таймауте) ──
+        code, stdout, stderr = _run_killgroup(
+            f"cd {repo} && git pull --ff-only 2>&1", timeout=30,
+        )
+        if code != 0 and "Timed out" not in stderr:
+            code, stdout, stderr = _run_killgroup(
+                f"cd {repo} && git pull 2>&1", timeout=30,
+            )
         if code != 0:
             _save_update_status({
                 "ok": False, "error": "git pull failed",
-                "details": stdout or stderr,
+                "details": (stdout or stderr)[:500],
                 "started_at": started_at,
                 "finished_at": _now_msk().isoformat(),
             })
+            logger.error("Update failed: git pull: %s", stdout or stderr)
             return
 
         no_changes = "Already up to date" in stdout or "Already up-to-date" in stdout
 
-        # ── Нет изменений → ничего не делаем, не перезапускаем ──
+        # Нет изменений → ничего не делаем
         if no_changes:
             _save_update_status({
                 "ok": True, "no_changes": True,
@@ -584,7 +623,7 @@ async def _do_update():
                 steps.append({"deps_error": str(e)})
         steps.append({"deps_updated": deps_updated})
 
-        # Сохраняем результат
+        # Результат
         _save_update_status({
             "ok": True,
             "old_version": AGENT_VERSION,
@@ -615,13 +654,20 @@ async def _do_update():
 
 @app.post("/update")
 async def self_update():
+    """
+    Принимает запрос, отвечает мгновенно, обновление в отдельном потоке.
+    """
     if not (REPO_DIR / ".git").exists():
         return {
             "accepted": False,
             "error": f"Git repo not found at {REPO_DIR}",
             "hint": "Install via: git clone <repo> /opt/warp-relay-panel",
         }
-    asyncio.create_task(_do_update())
+
+    # Запускаем в thread pool — НЕ блокирует event loop
+    loop = asyncio.get_event_loop()
+    loop.run_in_executor(None, _do_update_sync)
+
     return {
         "accepted": True,
         "message": "Update started in background",
