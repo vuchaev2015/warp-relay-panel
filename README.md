@@ -36,7 +36,7 @@ Telegram Bot  ──HTTP──▶  Vercel (FastAPI)  ──HTTP──▶  Relay 
 
 **Vercel — деплой одной кнопкой:**
 
-[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https://github.com/user/warp-relay-panel&repository-name=warp-relay-panel)
+[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https://github.com/openwarpkit/warp-relay-panel&repository-name=warp-relay-panel)
 
 После деплоя → **Settings → Environment Variables** → задать:
 
@@ -57,10 +57,10 @@ Telegram Bot  ──HTTP──▶  Vercel (FastAPI)  ──HTTP──▶  Relay 
 ssh root@RELAY_IP
 
 # Установка
-curl -fsSL https://raw.githubusercontent.com/user/warp-relay-panel/main/relay-agent/setup_relay.sh | bash
+curl -fsSL https://raw.githubusercontent.com/openwarpkit/warp-relay-panel/main/relay-agent/setup_relay.sh | bash
 
 # Или через git (рекомендуется — проще обновлять):
-git clone https://github.com/user/warp-relay-panel.git /opt/warp-relay-panel
+git clone https://github.com/openwarpkit/warp-relay-panel.git /opt/warp-relay-panel
 bash /opt/warp-relay-panel/relay-agent/setup_relay.sh
 ```
 
