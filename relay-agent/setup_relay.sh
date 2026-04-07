@@ -1,7 +1,6 @@
 #!/bin/bash
 # ═══════════════════════════════════════
 # WARP Relay — полная настройка relay-сервера
-# Устанавливает: ipset whitelist + iptables NAT + relay-agent
 # Запуск: sudo bash setup_relay.sh
 # ═══════════════════════════════════════
 
@@ -19,7 +18,6 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
-# ── Параметры ──
 read -p "Agent secret (общий с панелью): " AGENT_SECRET
 read -p "Agent port [7580]: " AGENT_PORT
 AGENT_PORT=${AGENT_PORT:-7580}
@@ -39,21 +37,18 @@ apt update -qq
 apt install -y -qq iptables ipset curl conntrack netfilter-persistent ipset-persistent python3 python3-pip python3-venv git
 
 # ═══════════════════════════════════════
-# 2. СИСТЕМА: timezone, ip_forward, conntrack
+# 2. СИСТЕМА
 # ═══════════════════════════════════════
 
 echo -e "${Y}[2/7] Настройка системы...${N}"
 
-# Часовой пояс МСК (для сброса трафика и логов)
 timedatectl set-timezone Europe/Moscow 2>/dev/null || ln -sf /usr/share/zoneinfo/Europe/Moscow /etc/localtime
 echo -e "${G}  Timezone: Europe/Moscow${N}"
 
-# ip_forward
 echo "net.ipv4.ip_forward=1" > /etc/sysctl.d/ipv4-forwarding.conf
 sysctl -w net.ipv4.ip_forward=1 >/dev/null
 echo -e "${G}  ip_forward: enabled${N}"
 
-# conntrack accounting для подсчёта трафика
 echo "net.netfilter.nf_conntrack_acct=1" > /etc/sysctl.d/conntrack-acct.conf
 sysctl -w net.netfilter.nf_conntrack_acct=1 >/dev/null 2>&1 || true
 echo -e "${G}  conntrack accounting: enabled${N}"
@@ -64,11 +59,11 @@ echo -e "${G}  conntrack accounting: enabled${N}"
 
 echo -e "${Y}[3/7] Создаём ipset warp_whitelist...${N}"
 ipset destroy warp_whitelist 2>/dev/null || true
-ipset create warp_whitelist hash:ip
-echo -e "${G}  ipset создан${N}"
+ipset create warp_whitelist hash:ip maxelem 1000000
+echo -e "${G}  ipset создан (maxelem 1000000)${N}"
 
 # ═══════════════════════════════════════
-# 4. IPTABLES — NAT + WHITELIST FORWARD
+# 4. IPTABLES
 # ═══════════════════════════════════════
 
 echo -e "${Y}[4/7] Настраиваем iptables...${N}"
@@ -79,7 +74,6 @@ DST_IP=$(getent ahostsv4 engage.cloudflareclient.com | awk '{print $1; exit}')
 echo -e "  Relay IP:  ${B}${SRC_IP}${N}"
 echo -e "  CF IP:     ${B}${DST_IP}${N}"
 
-# Удаляем старые правила
 iptables -t nat -S | grep "WR_RULE" | sed 's/^-A/-D/' | while read rule; do
     iptables -t nat $rule 2>/dev/null || true
 done
@@ -87,7 +81,6 @@ iptables -S | grep "WR_RULE\|WR_WHITELIST" | sed 's/^-A/-D/' | while read rule; 
     iptables $rule 2>/dev/null || true
 done
 
-# NAT — мультипорт
 PORTS=(500 854 859 864 878 880 890 891 894 903 908 928 934 939 942 943 945 946 955 968 987 988 1002 1010 1014 1018 1070 1074 1180 1387 1701 1843 2371 2408 2506 3138 3476 3581 3854 4177 4198 4233 4500 5279 5956 7103 7152 7156 7281 7559 8319 8742 8854 8886)
 
 CHUNK_SIZE=15
@@ -106,7 +99,6 @@ for ((i=0; i<${#PORTS[@]}; i+=CHUNK_SIZE)); do
         -m comment --comment "${TAG}"
 done
 
-# FORWARD — только из whitelist
 iptables -I FORWARD 1 \
     -p udp -d ${DST_IP} \
     -m set --match-set warp_whitelist src \
@@ -123,13 +115,11 @@ iptables -A FORWARD \
     -j DROP \
     -m comment --comment "WR_WHITELIST_DROP"
 
-# Сохранение
 netfilter-persistent save
 ipset save > /etc/ipset.rules 2>/dev/null || true
 
 echo -e "${G}  ${#PORTS[@]} портов настроено${N}"
 
-# ipset автозагрузка
 cat > /etc/systemd/system/ipset-restore.service << 'EOF'
 [Unit]
 Description=Restore ipset rules
@@ -148,7 +138,7 @@ systemctl daemon-reload
 systemctl enable ipset-restore.service
 
 # ═══════════════════════════════════════
-# 5. RELAY AGENT — файлы
+# 5. RELAY AGENT
 # ═══════════════════════════════════════
 
 echo -e "${Y}[5/7] Устанавливаем relay-agent...${N}"
@@ -161,7 +151,6 @@ if [ -f "${SCRIPT_DIR}/agent.py" ]; then
     echo -e "${G}  agent.py скопирован${N}"
 else
     echo -e "${R}  agent.py не найден рядом со скриптом!${N}"
-    echo -e "  Скопируйте agent.py в ${INSTALL_DIR}/ вручную"
 fi
 
 if [ -f "${SCRIPT_DIR}/ensure_rules.sh" ]; then
@@ -174,7 +163,7 @@ else
 IPSET_NAME="${IPSET_NAME:-warp_whitelist}"
 if ! ipset list "$IPSET_NAME" &>/dev/null; then
     [ -f /etc/ipset.rules ] && ipset restore -f /etc/ipset.rules 2>/dev/null
-    ipset list "$IPSET_NAME" &>/dev/null || ipset create "$IPSET_NAME" hash:ip 2>/dev/null
+    ipset list "$IPSET_NAME" &>/dev/null || ipset create "$IPSET_NAME" hash:ip maxelem 1000000 2>/dev/null
 fi
 if ! iptables -t nat -S 2>/dev/null | grep -q "WR_RULE"; then
     command -v netfilter-persistent &>/dev/null && netfilter-persistent reload 2>/dev/null
@@ -186,11 +175,9 @@ ENSURE_EOF
     echo -e "${G}  ensure_rules.sh создан${N}"
 fi
 
-# Python venv
 python3 -m venv ${INSTALL_DIR}/venv
 ${INSTALL_DIR}/venv/bin/pip install -q fastapi uvicorn python-dotenv
 
-# .env
 cat > ${INSTALL_DIR}/.env << EOF
 AGENT_SECRET=${AGENT_SECRET}
 AGENT_PORT=${AGENT_PORT}
@@ -200,7 +187,7 @@ EOF
 echo -e "${G}  venv и .env созданы${N}"
 
 # ═══════════════════════════════════════
-# 6. SYSTEMD SERVICE
+# 6. SYSTEMD
 # ═══════════════════════════════════════
 
 echo -e "${Y}[6/7] Настраиваем systemd...${N}"
@@ -230,11 +217,11 @@ sleep 2
 if systemctl is-active --quiet warp-relay-agent; then
     echo -e "${G}  Agent запущен на порту ${AGENT_PORT}${N}"
 else
-    echo -e "${R}  Agent не запустился! Проверь: journalctl -u warp-relay-agent${N}"
+    echo -e "${R}  Agent не запустился! journalctl -u warp-relay-agent${N}"
 fi
 
 # ═══════════════════════════════════════
-# 7. UPDATE SCRIPT
+# 7. UPDATE
 # ═══════════════════════════════════════
 
 echo -e "${Y}[7/7] Настраиваем обновления...${N}"
@@ -259,7 +246,7 @@ echo -e "  ${C}Relay IP:${N}         ${B}${SRC_IP}${N}"
 echo -e "  ${C}Agent:${N}            ${B}http://${SRC_IP}:${AGENT_PORT}${N}"
 echo -e "  ${C}Timezone:${N}         ${B}Europe/Moscow${N}"
 echo -e "  ${C}WARP ports:${N}       ${B}${#PORTS[@]} портов${N}"
-echo -e "  ${C}Whitelist ipset:${N}  ${B}warp_whitelist${N}"
+echo -e "  ${C}Whitelist ipset:${N}  ${B}warp_whitelist (maxelem 1M)${N}"
 echo ""
 echo -e "  ${Y}Проверка:${N}"
 echo -e "  curl http://localhost:${AGENT_PORT}/health"

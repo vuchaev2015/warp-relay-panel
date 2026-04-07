@@ -441,7 +441,7 @@ async def whitelist_remove(data: IPRequest):
 async def whitelist_sync(data: SyncRequest):
     valid_entries = [e for e in data.clients if _valid_ip(e.ip)]
     invalid = [e.ip for e in data.clients if not _valid_ip(e.ip)]
-    _run(f"ipset create {IPSET_NAME} hash:ip 2>/dev/null")
+    _run(f"ipset create {IPSET_NAME} hash:ip maxelem 1000000 2>/dev/null")
     _run(f"ipset flush {IPSET_NAME}", check=True)
     unique_ips = set()
     rc_entries = []

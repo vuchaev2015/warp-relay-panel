@@ -2,7 +2,6 @@
 # ═══════════════════════════════════════
 # WARP Relay — восстановление правил
 # Вызывается перед стартом агента (ExecStartPre)
-# Проверяет ipset и iptables, восстанавливает если пропали
 # ═══════════════════════════════════════
 
 IPSET_NAME="${IPSET_NAME:-warp_whitelist}"
@@ -20,17 +19,17 @@ if ! ipset list "$IPSET_NAME" &>/dev/null; then
             echo -e "${G}[ensure] ipset восстановлен${N}"
         else
             echo -e "${R}[ensure] Не удалось восстановить, создаём пустой${N}"
-            ipset create "$IPSET_NAME" hash:ip 2>/dev/null
+            ipset create "$IPSET_NAME" hash:ip maxelem 1000000 2>/dev/null
         fi
     else
         echo -e "${Y}[ensure] /etc/ipset.rules не найден, создаём пустой ipset${N}"
-        ipset create "$IPSET_NAME" hash:ip 2>/dev/null
+        ipset create "$IPSET_NAME" hash:ip maxelem 1000000 2>/dev/null
     fi
 else
     echo "[ensure] ipset '$IPSET_NAME' OK"
 fi
 
-# ── iptables (проверяем наличие WR_RULE) ──
+# ── iptables ──
 if ! iptables -t nat -S 2>/dev/null | grep -q "$TAG"; then
     echo -e "${Y}[ensure] iptables NAT правила не найдены${N}"
     if command -v netfilter-persistent &>/dev/null; then
