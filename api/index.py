@@ -218,7 +218,8 @@ async def activate(token: str, request: Request):
         return HTMLResponse(TMPL_BOT, status_code=200)
 
     client_ip = (
-        request.headers.get("X-Real-IP")
+        request.headers.get("x-relay-real-ip")
+        or request.headers.get("X-Real-IP")
         or request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
         or request.client.host
     )
