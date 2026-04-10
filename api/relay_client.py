@@ -11,6 +11,7 @@ from . import database as db
 logger = logging.getLogger("relay_client")
 
 AGENT_TIMEOUT = 10.0
+SYNC_TIMEOUT = 30.0  # Для /whitelist/sync (большой payload)
 
 
 def _validate_ipv4(ip: str) -> str:
@@ -113,9 +114,13 @@ async def remove_ip(ip: str) -> dict:
 
 
 async def full_sync(relay_id: int | None = None) -> dict:
+    """
+    Отправляет whitelist на relay-агенты. Агент принимает данные и обрабатывает
+    их в фоне (fire-and-forget), чтобы не упираться в Vercel timeout.
+    Реальный результат проверяется через /health → last_sync.
+    """
     clients = db.list_clients(include_blocked=False)
 
-    # Собираем забаненные IP для фильтрации
     banned_ips = {ban["ip"] for ban in db.list_ip_bans()}
 
     client_entries = []
@@ -147,15 +152,25 @@ async def full_sync(relay_id: int | None = None) -> dict:
         ok, data = await _agent_request(
             relay, "POST", "/whitelist/sync",
             {"clients": client_entries},
+            timeout=SYNC_TIMEOUT,
         )
+        # Пометка synced=True если агент принял payload.
+        # Фактический результат (успешно ли закомиттился ipset) придёт через /health.
         db.mark_relay_synced(relay["id"], ok)
         results[relay["name"]] = {
-            "ok": ok, "ips_synced": len(client_entries) if ok else 0,
-            "skipped_banned": skipped_banned, **data,
+            "ok": ok,
+            "accepted": data.get("accepted", False) if ok else False,
+            "received": data.get("received", 0) if ok else 0,
+            "skipped_banned": skipped_banned,
+            **data,
         }
 
     await asyncio.gather(*[_sync(r) for r in relays], return_exceptions=True)
-    return results
+    return {
+        "total_clients": len(client_entries),
+        "skipped_banned": skipped_banned,
+        "relays": results,
+    }
 
 
 # ═══════════════════════════════════════

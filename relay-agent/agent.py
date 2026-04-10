@@ -4,6 +4,7 @@
 — трафик по IP (conntrack accounting)
 — точный онлайн (ipset ∩ conntrack ASSURED)
 — самообновление через /update (fire-and-forget)
+— фоновая синхронизация whitelist через /whitelist/sync (fire-and-forget)
 """
 
 import asyncio
@@ -33,6 +34,7 @@ REPO_DIR = Path(os.environ.get("REPO_DIR", "/opt/warp-relay-panel"))
 TRAFFIC_FILE = DATA_DIR / "traffic.json"
 REFCOUNT_FILE = DATA_DIR / "refcount.json"
 UPDATE_STATUS_FILE = DATA_DIR / "update_status.json"
+SYNC_STATUS_FILE = DATA_DIR / "sync_status.json"
 TRAFFIC_INTERVAL = int(os.environ.get("TRAFFIC_INTERVAL", "30"))
 
 MSK = timezone(timedelta(hours=3))
@@ -40,7 +42,7 @@ MSK = timezone(timedelta(hours=3))
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
 logger = logging.getLogger("agent")
 
-AGENT_VERSION = "1.2.1"
+AGENT_VERSION = "1.2.2"
 app = FastAPI(title="WARP Relay Agent", version=AGENT_VERSION)
 
 
@@ -90,7 +92,6 @@ def _run(cmd: str, check: bool = False, timeout: int = 10) -> tuple[int, str, st
 
 
 def _run_killgroup(cmd: str, timeout: int = 30) -> tuple[int, str, str]:
-    """Запуск с убийством всей process group при таймауте."""
     proc = subprocess.Popen(
         cmd, shell=True,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
@@ -121,7 +122,6 @@ def _now_msk() -> datetime:
 
 
 def _get_ipset_members() -> set[str]:
-    """Получить все IP из ipset whitelist."""
     code, stdout, _ = _run(f"ipset list {IPSET_NAME} 2>/dev/null")
     if code != 0:
         return set()
@@ -137,7 +137,6 @@ def _get_ipset_members() -> set[str]:
 
 
 def _get_conntrack_assured_ips() -> set[str]:
-    """Уникальные src IP с ASSURED UDP-сессиями (реально подключённые)."""
     code, stdout, _ = _run(
         "conntrack -L -p udp 2>/dev/null | grep ASSURED | "
         "grep -oP '^.*?src=\\K[0-9.]+' | grep -v '^162\\.159\\.' | sort -u"
@@ -148,15 +147,10 @@ def _get_conntrack_assured_ips() -> set[str]:
 
 
 def _get_online_clients() -> dict:
-    """
-    Точный онлайн: пересечение ipset whitelist и conntrack ASSURED.
-    Только IP которые и разрешены, и реально имеют активные сессии.
-    """
     whitelist = _get_ipset_members()
     assured = _get_conntrack_assured_ips()
-    online_ips = whitelist & assured  # пересечение
+    online_ips = whitelist & assured
 
-    # Добавляем client_ids из refcount для каждого онлайн IP
     online = []
     for ip in sorted(online_ips):
         client_ids = sorted(refcount._map.get(ip, set()))
@@ -210,7 +204,10 @@ class RefCountMap:
         return can_remove_old
 
     def remove_client(self, ip: str, client_id: int | None = None) -> bool:
-        if ip not in self._map:
+        # Если IP нет в map или set пустой (осиротевший) — можно удалять из ipset
+        if ip not in self._map or not self._map[ip]:
+            self._map.pop(ip, None)
+            self._save()
             return True
         if client_id is not None:
             self._map[ip].discard(client_id)
@@ -419,6 +416,40 @@ async def on_startup():
 
 
 # ═══════════════════════════════════════
+# STATUS FILES
+# ═══════════════════════════════════════
+
+def _load_update_status() -> dict | None:
+    try:
+        return json.loads(UPDATE_STATUS_FILE.read_text())
+    except Exception:
+        return None
+
+
+def _save_update_status(status: dict):
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        UPDATE_STATUS_FILE.write_text(json.dumps(status, indent=2))
+    except Exception as e:
+        logger.error("Could not save update status: %s", e)
+
+
+def _load_sync_status() -> dict | None:
+    try:
+        return json.loads(SYNC_STATUS_FILE.read_text())
+    except Exception:
+        return None
+
+
+def _save_sync_status(status: dict):
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        SYNC_STATUS_FILE.write_text(json.dumps(status, indent=2))
+    except Exception as e:
+        logger.error("Could not save sync status: %s", e)
+
+
+# ═══════════════════════════════════════
 # SCHEMAS
 # ═══════════════════════════════════════
 
@@ -484,22 +515,76 @@ async def whitelist_remove(data: IPRequest):
         return {"removed": None, "kept": data.ip, "refcount": rc}
 
 
+# ── Фоновая синхронизация ──
+
+def _do_sync_sync(entries: list[dict]):
+    """Синхронная работа с ipset в отдельном потоке."""
+    started_at = _now_msk().isoformat()
+    _save_sync_status({
+        "ok": None,
+        "in_progress": True,
+        "total": len(entries),
+        "started_at": started_at,
+        "finished_at": None,
+    })
+
+    try:
+        valid = [e for e in entries if _valid_ip(e["ip"])]
+        invalid = [e["ip"] for e in entries if not _valid_ip(e["ip"])]
+
+        _run(f"ipset create {IPSET_NAME} hash:ip maxelem 1000000 2>/dev/null")
+        _run(f"ipset flush {IPSET_NAME}", check=True)
+
+        unique_ips = set()
+        rc_entries = []
+        for entry in valid:
+            unique_ips.add(entry["ip"])
+            rc_entries.append((entry["ip"], entry["client_id"]))
+
+        for ip in unique_ips:
+            _run(f"ipset add {IPSET_NAME} {ip}")
+
+        refcount.set_all(rc_entries)
+        _run("ipset save > /etc/ipset.rules 2>/dev/null")
+
+        _save_sync_status({
+            "ok": True,
+            "in_progress": False,
+            "synced": len(unique_ips),
+            "clients": len(valid),
+            "invalid": len(invalid),
+            "started_at": started_at,
+            "finished_at": _now_msk().isoformat(),
+        })
+        logger.info("Sync complete: %d IPs, %d clients, %d invalid",
+                    len(unique_ips), len(valid), len(invalid))
+
+    except Exception as e:
+        logger.error("Sync failed: %s", e)
+        _save_sync_status({
+            "ok": False,
+            "in_progress": False,
+            "error": str(e),
+            "started_at": started_at,
+            "finished_at": _now_msk().isoformat(),
+        })
+
+
 @app.post("/whitelist/sync")
 async def whitelist_sync(data: SyncRequest):
-    valid_entries = [e for e in data.clients if _valid_ip(e.ip)]
-    invalid = [e.ip for e in data.clients if not _valid_ip(e.ip)]
-    _run(f"ipset create {IPSET_NAME} hash:ip maxelem 1000000 2>/dev/null")
-    _run(f"ipset flush {IPSET_NAME}", check=True)
-    unique_ips = set()
-    rc_entries = []
-    for entry in valid_entries:
-        unique_ips.add(entry.ip)
-        rc_entries.append((entry.ip, entry.client_id))
-    for ip in unique_ips:
-        _run(f"ipset add {IPSET_NAME} {ip}")
-    refcount.set_all(rc_entries)
-    _run("ipset save > /etc/ipset.rules 2>/dev/null")
-    return {"synced": len(unique_ips), "clients": len(valid_entries), "invalid": invalid}
+    """Fire-and-forget: принимаем данные, обрабатываем в фоне."""
+    entries = [{"ip": e.ip, "client_id": e.client_id} for e in data.clients]
+    total = len(entries)
+
+    loop = asyncio.get_event_loop()
+    loop.run_in_executor(None, _do_sync_sync, entries)
+
+    return {
+        "accepted": True,
+        "received": total,
+        "message": "Sync started in background",
+        "check_status": "GET /health → last_sync",
+    }
 
 
 @app.get("/whitelist/list")
@@ -548,10 +633,6 @@ async def traffic_reset():
     return {"ok": True, "month": traffic_monitor.traffic["month"]}
 
 
-# ═══════════════════════════════════════
-# REFCOUNT
-# ═══════════════════════════════════════
-
 @app.get("/refcount")
 async def refcount_list():
     return refcount.get_all()
@@ -561,23 +642,7 @@ async def refcount_list():
 # SELF-UPDATE
 # ═══════════════════════════════════════
 
-def _load_update_status() -> dict | None:
-    try:
-        return json.loads(UPDATE_STATUS_FILE.read_text())
-    except Exception:
-        return None
-
-
-def _save_update_status(status: dict):
-    try:
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        UPDATE_STATUS_FILE.write_text(json.dumps(status, indent=2))
-    except Exception as e:
-        logger.error("Could not save update status: %s", e)
-
-
 def _do_update_sync():
-    """Синхронная функция обновления в отдельном потоке."""
     repo = str(REPO_DIR)
     install = str(DATA_DIR)
     agent_src = f"{repo}/relay-agent"
@@ -746,6 +811,7 @@ async def health():
     t = traffic_monitor.get_all()
     online = _get_online_clients()
     update_status = _load_update_status()
+    sync_status = _load_sync_status()
 
     return {
         "status": "ok",
@@ -761,6 +827,7 @@ async def health():
         "traffic_total": t["total"],
         "traffic_ips": t["ip_count"],
         "last_update": update_status,
+        "last_sync": sync_status,
     }
 
 

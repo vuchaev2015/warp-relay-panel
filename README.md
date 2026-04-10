@@ -1,4 +1,4 @@
-# WARP Relay Panel v1.2.1
+# WARP Relay Panel v1.2.2
 
 Панель управления whitelist для WARP Relay серверов.  
 Бесплатный хостинг на **Vercel + Supabase**.
@@ -333,6 +333,14 @@ warp-relay-panel/
 ---
 
 ## Changelog
+
+### v1.2.2
+- Фоновая синхронизация whitelist через `/whitelist/sync`
+- Статус последней синхронизации в `/health` → `last_sync` (`ok`, `synced`, `clients`, `in_progress`)
+- Пагинация выборок из Supabase (`list_clients`, `list_ip_bans`, `get_all_active_ips`)
+- Исправлено удаление осиротевших IP из ipset (`RefCountMap.remove_client` — когда refcount=0, но IP остался в map)
+- Таймаут HTTP-запросов на `/whitelist/sync` поднят до 30 сек (страховка для больших payload)
+- В ответе `full_sync` теперь `{total_clients, skipped_banned, relays: {...}}` вместо плоского словаря
 
 ### v1.2.1
 - Обновление relay через API (fire-and-forget, без таймаутов Vercel)

@@ -38,7 +38,7 @@ from . import relay_client
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
 logger = logging.getLogger("panel")
 
-API_VERSION = "1.2.1"
+API_VERSION = "1.2.2"
 app = FastAPI(title="WARP Relay Panel", version=API_VERSION)
 
 

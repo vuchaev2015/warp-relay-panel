@@ -13,6 +13,9 @@ from .crypto import encrypt_ip, decrypt_ip, hash_ip
 
 _client: Optional[Client] = None
 
+# Размер страницы для пагинации
+_PAGE_SIZE = 10000
+
 
 def _db() -> Client:
     global _client
@@ -22,6 +25,25 @@ def _db() -> Client:
             os.environ["SUPABASE_KEY"],
         )
     return _client
+
+
+def _fetch_all_paginated(query_builder_fn) -> list:
+    """
+    Пагинированная выборка всех строк.
+    query_builder_fn(offset, limit) должен возвращать готовый query с .range() уже применённым.
+    """
+    all_rows = []
+    offset = 0
+    while True:
+        query = query_builder_fn(offset, _PAGE_SIZE)
+        result = query.execute()
+        if not result.data:
+            break
+        all_rows.extend(result.data)
+        if len(result.data) < _PAGE_SIZE:
+            break
+        offset += _PAGE_SIZE
+    return all_rows
 
 
 # ═══════════════════════════════════════
@@ -51,11 +73,15 @@ def get_client_by_id(client_id: int) -> Optional[dict]:
 
 
 def list_clients(include_blocked: bool = True) -> list[dict]:
-    query = _db().table("clients").select("*").order("id")
-    if not include_blocked:
-        query = query.eq("is_blocked", False)
-    result = query.execute()
-    return [_decrypt_client(r) for r in result.data]
+    """Получение ВСЕХ клиентов с пагинацией (обходит лимит Supabase в 1000)."""
+    def _build(offset: int, limit: int):
+        q = _db().table("clients").select("*").order("id").range(offset, offset + limit - 1)
+        if not include_blocked:
+            q = q.eq("is_blocked", False)
+        return q
+
+    rows = _fetch_all_paginated(_build)
+    return [_decrypt_client(r) for r in rows]
 
 
 def count_clients_on_ip(ip: str, exclude_client_id: int | None = None) -> int:
@@ -84,7 +110,6 @@ def activate_client(token: str, new_ip: str, user_agent: str = "") -> dict:
     if client["is_blocked"]:
         return {"error": "blocked"}
 
-    # Проверка IP-бана
     ban = get_ip_ban(new_ip)
     if ban:
         return {"error": "ip_banned", "reason": ban["reason"]}
@@ -92,7 +117,6 @@ def activate_client(token: str, new_ip: str, user_agent: str = "") -> dict:
     max_act = int(os.environ.get("MAX_ACTIVATIONS_PER_DAY", "10"))
     today = date.today().isoformat()
 
-    # Сброс счётчика если новый день
     activations_today = client["_activations_today"]
     if client["_reset_date"] != today:
         activations_today = 0
@@ -102,17 +126,14 @@ def activate_client(token: str, new_ip: str, user_agent: str = "") -> dict:
 
     old_ip = client["current_ip"]
 
-    # Тот же IP — ничего не делаем
     if old_ip == new_ip:
         return {"status": "already_active", "client_id": client["id"], "new_ip": new_ip}
 
-    # Проверяем: есть ли ещё кто-то на old_ip?
     old_ip_shared = False
     if old_ip:
         others = count_clients_on_ip(old_ip, exclude_client_id=client["id"])
         old_ip_shared = others > 0
 
-    # Обновляем клиента
     now = datetime.now(timezone.utc).isoformat()
     update_data = {
         "previous_ip_enc": client["_raw_current_ip_enc"],
@@ -124,7 +145,6 @@ def activate_client(token: str, new_ip: str, user_agent: str = "") -> dict:
     }
     _db().table("clients").update(update_data).eq("id", client["id"]).execute()
 
-    # Лог активации
     _db().table("activation_log").insert({
         "client_id": client["id"],
         "ip_enc": encrypt_ip(new_ip),
@@ -141,14 +161,13 @@ def activate_client(token: str, new_ip: str, user_agent: str = "") -> dict:
 
 
 def activate_client_by_id(client_id: int, new_ip: str) -> dict:
-    """Ручная активация по client_id и IP (вызывается ботом через API)."""
+    """Ручная активация по client_id и IP."""
     client = get_client_by_id(client_id)
     if not client:
         return {"error": "client_not_found"}
     if client["is_blocked"]:
         return {"error": "blocked"}
 
-    # Проверка IP-бана
     ban = get_ip_ban(new_ip)
     if ban:
         return {"error": "ip_banned", "reason": ban["reason"]}
@@ -204,7 +223,6 @@ def block_client(client_id: int, blocked: bool = True):
 
 
 def delete_client(client_id: int) -> Optional[dict]:
-    """Удаляет клиента, возвращает его данные (с расшифрованным IP)."""
     client = get_client_by_id(client_id)
     if not client:
         return None
@@ -240,16 +258,20 @@ def get_activation_logs(client_id: int, limit: int = 50) -> list[dict]:
 
 
 def get_all_active_ips() -> list[str]:
-    """Все незаблокированные IP для полной синхронизации."""
-    result = (
-        _db().table("clients")
-        .select("current_ip_enc")
-        .eq("is_blocked", False)
-        .not_.is_("current_ip_enc", "null")
-        .execute()
-    )
+    """Все незаблокированные IP для полной синхронизации (с пагинацией)."""
+    def _build(offset: int, limit: int):
+        return (
+            _db().table("clients")
+            .select("current_ip_enc")
+            .eq("is_blocked", False)
+            .not_.is_("current_ip_enc", "null")
+            .order("id")
+            .range(offset, offset + limit - 1)
+        )
+
+    rows = _fetch_all_paginated(_build)
     ips = []
-    for r in result.data:
+    for r in rows:
         try:
             ips.append(decrypt_ip(r["current_ip_enc"]))
         except Exception:
@@ -258,7 +280,6 @@ def get_all_active_ips() -> list[str]:
 
 
 def _decrypt_client(row: dict) -> dict:
-    """Расшифровывает IP-поля, убирает enc-столбцы."""
     current_ip = None
     previous_ip = None
     if row.get("current_ip_enc"):
@@ -283,7 +304,6 @@ def _decrypt_client(row: dict) -> dict:
         "activations_today": row["activations_today"],
         "is_blocked": row["is_blocked"],
         "created_at": row["created_at"],
-        # Приватные поля для внутреннего использования
         "_activations_today": row["activations_today"],
         "_reset_date": row.get("activations_reset_date"),
         "_raw_current_ip_enc": row.get("current_ip_enc"),
@@ -295,10 +315,7 @@ def _decrypt_client(row: dict) -> dict:
 # ═══════════════════════════════════════
 
 def add_ip_ban(ip: str, reason: str = "") -> dict:
-    """Добавить IP в чёрный список."""
     ip_h = hash_ip(ip)
-
-    # Проверяем дубликат
     existing = (
         _db().table("ip_blacklist")
         .select("id")
@@ -319,20 +336,17 @@ def add_ip_ban(ip: str, reason: str = "") -> dict:
 
 
 def remove_ip_ban(ban_id: int) -> bool:
-    """Удалить IP из чёрного списка по ID записи."""
     result = _db().table("ip_blacklist").delete().eq("id", ban_id).execute()
     return len(result.data) > 0
 
 
 def remove_ip_ban_by_ip(ip: str) -> bool:
-    """Удалить IP из чёрного списка по самому IP."""
     ip_h = hash_ip(ip)
     result = _db().table("ip_blacklist").delete().eq("ip_hash", ip_h).execute()
     return len(result.data) > 0
 
 
 def is_ip_banned(ip: str) -> bool:
-    """Быстрая проверка: забанен ли IP."""
     ip_h = hash_ip(ip)
     result = (
         _db().table("ip_blacklist")
@@ -344,7 +358,6 @@ def is_ip_banned(ip: str) -> bool:
 
 
 def get_ip_ban(ip: str) -> Optional[dict]:
-    """Получить запись бана по IP (или None)."""
     ip_h = hash_ip(ip)
     result = (
         _db().table("ip_blacklist")
@@ -368,15 +381,18 @@ def get_ip_ban(ip: str) -> Optional[dict]:
 
 
 def list_ip_bans() -> list[dict]:
-    """Список всех забаненных IP."""
-    result = (
-        _db().table("ip_blacklist")
-        .select("*")
-        .order("created_at", desc=True)
-        .execute()
-    )
+    """Список ВСЕХ забаненных IP с пагинацией."""
+    def _build(offset: int, limit: int):
+        return (
+            _db().table("ip_blacklist")
+            .select("*")
+            .order("created_at", desc=True)
+            .range(offset, offset + limit - 1)
+        )
+
+    rows = _fetch_all_paginated(_build)
     bans = []
-    for row in result.data:
+    for row in rows:
         try:
             ip = decrypt_ip(row["ip_enc"])
         except Exception:
