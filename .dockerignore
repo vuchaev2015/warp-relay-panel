@@ -1,0 +1,42 @@
+# Git
+.git
+.gitignore
+.github
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info
+.pytest_cache
+.venv
+venv
+env
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# Vercel
+.vercel
+vercel.json
+
+# Docs / misc
+README.md
+*.md
+LICENSE
+
+# Relay agent (деплоится отдельно на relay-серверах)
+relay-agent
+
+# SQL (применяется вручную в Supabase)
+supabase_schema.sql
+
+# IDE
+.vscode
+.idea
+*.swp
+.DS_Store
