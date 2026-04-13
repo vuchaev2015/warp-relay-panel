@@ -137,6 +137,7 @@ def activate_client(token: str, new_ip: str, user_agent: str = "") -> dict:
     now = datetime.now(timezone.utc).isoformat()
     update_data = {
         "previous_ip_enc": client["_raw_current_ip_enc"],
+        "previous_ip_hash": client.get("_raw_current_ip_hash"),
         "current_ip_enc": encrypt_ip(new_ip),
         "current_ip_hash": hash_ip(new_ip),
         "last_activated_at": now,
@@ -148,6 +149,7 @@ def activate_client(token: str, new_ip: str, user_agent: str = "") -> dict:
     _db().table("activation_log").insert({
         "client_id": client["id"],
         "ip_enc": encrypt_ip(new_ip),
+        "ip_hash": hash_ip(new_ip),  # ← новое
         "user_agent": user_agent[:500] if user_agent else None,
     }).execute()
 
@@ -195,6 +197,7 @@ def activate_client_by_id(client_id: int, new_ip: str) -> dict:
     now = datetime.now(timezone.utc).isoformat()
     update_data = {
         "previous_ip_enc": client["_raw_current_ip_enc"],
+        "previous_ip_hash": client.get("_raw_current_ip_hash"),
         "current_ip_enc": encrypt_ip(new_ip),
         "current_ip_hash": hash_ip(new_ip),
         "last_activated_at": now,
@@ -307,6 +310,7 @@ def _decrypt_client(row: dict) -> dict:
         "_activations_today": row["activations_today"],
         "_reset_date": row.get("activations_reset_date"),
         "_raw_current_ip_enc": row.get("current_ip_enc"),
+        "_raw_current_ip_hash": row.get("current_ip_hash"),
     }
 
 
@@ -453,3 +457,56 @@ def update_relay_health(relay_id: int, health_data: dict):
         "last_health": health_data,
         "last_health_at": datetime.now(timezone.utc).isoformat(),
     }).eq("id", relay_id).execute()
+
+
+def backfill_previous_ip_hashes() -> dict:
+    """Заполнить previous_ip_hash для всех клиентов где есть previous_ip_enc."""
+    result = (
+        _db().table("clients")
+        .select("id,previous_ip_enc")
+        .not_.is_("previous_ip_enc", "null")
+        .execute()
+    )
+    updated = 0
+    errors = 0
+    for row in result.data:
+        try:
+            ip = decrypt_ip(row["previous_ip_enc"])
+            _db().table("clients").update({"previous_ip_hash": hash_ip(ip)}).eq("id", row["id"]).execute()
+            updated += 1
+        except Exception:
+            errors += 1
+    return {"updated": updated, "errors": errors, "total": len(result.data)}
+
+
+def backfill_activation_log_hashes(batch_size: int = 500) -> dict:
+    """Заполнить ip_hash для activation_log батчами."""
+    total_updated = 0
+    total_errors = 0
+    offset = 0
+
+    while True:
+        result = (
+            _db().table("activation_log")
+            .select("id,ip_enc")
+            .is_("ip_hash", "null")
+            .order("id")
+            .limit(batch_size)
+            .execute()
+        )
+        if not result.data:
+            break
+
+        for row in result.data:
+            try:
+                ip = decrypt_ip(row["ip_enc"])
+                _db().table("activation_log").update({"ip_hash": hash_ip(ip)}).eq("id", row["id"]).execute()
+                total_updated += 1
+            except Exception:
+                total_errors += 1
+
+        if len(result.data) < batch_size:
+            break
+        offset += batch_size
+
+    return {"updated": total_updated, "errors": total_errors}
