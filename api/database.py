@@ -314,6 +314,52 @@ def _decrypt_client(row: dict) -> dict:
     }
 
 
+def search_clients_by_ip(ip: str, include_log_history: bool = True) -> list[dict]:
+    """
+    Найти клиентов:
+      - current_ip == ip
+      - previous_ip == ip
+      - (опц.) был такой IP в activation_log
+    
+    Один запрос на каждый источник, потом UNION в Python (Supabase JS SDK не умеет UNION).
+    """
+    ip_h = hash_ip(ip)
+    found_ids: set[int] = set()
+    rows: list[dict] = []
+
+    # 1. По current_ip
+    r1 = _db().table("clients").select("*").eq("current_ip_hash", ip_h).execute()
+    for row in r1.data or []:
+        if row["id"] not in found_ids:
+            found_ids.add(row["id"])
+            rows.append(row)
+
+    # 2. По previous_ip
+    r2 = _db().table("clients").select("*").eq("previous_ip_hash", ip_h).execute()
+    for row in r2.data or []:
+        if row["id"] not in found_ids:
+            found_ids.add(row["id"])
+            rows.append(row)
+
+    # 3. По логам — берём DISTINCT client_id из activation_log с этим ip_hash
+    if include_log_history:
+        r3 = (
+            _db().table("activation_log")
+            .select("client_id")
+            .eq("ip_hash", ip_h)
+            .execute()
+        )
+        log_client_ids = {r["client_id"] for r in (r3.data or [])} - found_ids
+        if log_client_ids:
+            r4 = _db().table("clients").select("*").in_("id", list(log_client_ids)).execute()
+            for row in r4.data or []:
+                if row["id"] not in found_ids:
+                    found_ids.add(row["id"])
+                    rows.append(row)
+
+    return [_decrypt_client(r) for r in rows]
+
+
 # ═══════════════════════════════════════
 # IP BLACKLIST
 # ═══════════════════════════════════════
@@ -384,30 +430,65 @@ def get_ip_ban(ip: str) -> Optional[dict]:
     }
 
 
-def list_ip_bans() -> list[dict]:
-    """Список ВСЕХ забаненных IP с пагинацией."""
-    def _build(offset: int, limit: int):
-        return (
-            _db().table("ip_blacklist")
-            .select("*")
-            .order("created_at", desc=True)
-            .range(offset, offset + limit - 1)
-        )
+def get_ip_ban_by_id(ban_id: int) -> Optional[dict]:
+    result = _db().table("ip_blacklist").select("*").eq("id", ban_id).execute()
+    if not result.data:
+        return None
+    row = result.data[0]
+    try:
+        ip = decrypt_ip(row["ip_enc"])
+    except Exception:
+        ip = "decrypt_error"
+    return {
+        "id": row["id"], "ip": ip,
+        "reason": row["reason"], "created_at": row["created_at"],
+    }
 
-    rows = _fetch_all_paginated(_build)
-    bans = []
-    for row in rows:
+
+def list_ip_bans_paginated(
+    page: int = 0,
+    per_page: int = 20,
+    search: str | None = None,
+) -> dict:
+    """
+    Серверная пагинация блэклиста.
+    search — поиск по hash (точное совпадение IP).
+    Возвращает {items, total, page, per_page, total_pages}.
+    """
+    query = _db().table("ip_blacklist").select("*", count="exact")
+
+    if search and search.strip():
+        ip_h = hash_ip(search.strip())
+        query = query.eq("ip_hash", ip_h)
+
+    offset = page * per_page
+    result = (
+        query.order("created_at", desc=True)
+        .range(offset, offset + per_page - 1)
+        .execute()
+    )
+
+    items = []
+    for row in result.data or []:
         try:
             ip = decrypt_ip(row["ip_enc"])
         except Exception:
             ip = "decrypt_error"
-        bans.append({
+        items.append({
             "id": row["id"],
             "ip": ip,
             "reason": row["reason"],
             "created_at": row["created_at"],
         })
-    return bans
+
+    total = result.count or 0
+    return {
+        "items": items,
+        "total": total,
+        "page": page,
+        "per_page": per_page,
+        "total_pages": max(1, (total + per_page - 1) // per_page),
+    }
 
 
 # ═══════════════════════════════════════
