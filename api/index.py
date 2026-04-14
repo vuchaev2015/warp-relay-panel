@@ -605,58 +605,21 @@ async def api_traffic_all():
 
 @app.get("/api/stats", dependencies=[Depends(require_api_key)])
 async def api_stats():
-    """Лёгкая статистика через count, без выгрузки записей."""
-    from .database import _db
-    
-    total_clients = _db().table("clients").select("id", count="exact").execute().count or 0
-    blocked_clients = _db().table("clients").select("id", count="exact").eq("is_blocked", True).execute().count or 0
-    active_clients = (
-        _db().table("clients").select("id", count="exact")
-        .eq("is_blocked", False)
-        .not_.is_("current_ip_enc", "null")
-        .execute().count or 0
-    )
-    bans_count = _db().table("ip_blacklist").select("id", count="exact").execute().count or 0
-    relays = list_relays(fields="basic")
-    
-    return {
-        "total_clients": total_clients,
-        "active_clients": active_clients,
-        "blocked_clients": blocked_clients,
-        "total_relays": len(relays),
-        "active_relays": sum(1 for r in relays if r["is_active"]),
-        "ip_bans": bans_count,
-    }
+    """Лёгкая статистика через RPC dashboard_stats."""
+    from .database import get_dashboard_stats
+    return get_dashboard_stats()
 
 
 @app.get("/api/dashboard", dependencies=[Depends(require_api_key)])
 async def api_dashboard():
-    """Один батч для главного экрана: relays(basic) + stats."""
+    """Главный экран: relays(basic) + stats. Stats через RPC."""
+    from .database import get_dashboard_stats
     relays = list_relays(fields="basic")
-    
-    # Считаем stats прямо здесь, чтобы избежать второго round-trip к Supabase для list_clients()
-    # Используем count="exact" вместо выгрузки всех записей
-    from .database import _db
-    
-    total_clients_q = _db().table("clients").select("id", count="exact").execute()
-    blocked_clients_q = _db().table("clients").select("id", count="exact").eq("is_blocked", True).execute()
-    active_clients_q = (
-        _db().table("clients").select("id", count="exact")
-        .eq("is_blocked", False)
-        .not_.is_("current_ip_enc", "null")
-        .execute()
-    )
-    bans_q = _db().table("ip_blacklist").select("id", count="exact").execute()
-    
-    stats = {
-        "total_clients": total_clients_q.count or 0,
-        "active_clients": active_clients_q.count or 0,
-        "blocked_clients": blocked_clients_q.count or 0,
-        "total_relays": len(relays),
-        "active_relays": sum(1 for r in relays if r["is_active"]),
-        "ip_bans": bans_q.count or 0,
-    }
-    
+    stats = get_dashboard_stats()
+
+    stats["total_relays"] = len(relays)
+    stats["active_relays"] = sum(1 for r in relays if r.get("is_active"))
+
     return {"relays": relays, "stats": stats}
 
 

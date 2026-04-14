@@ -50,6 +50,23 @@ def _fetch_all_paginated(query_builder_fn) -> list:
 # CLIENTS
 # ═══════════════════════════════════════
 
+
+def get_dashboard_stats() -> dict:
+    """Все счётчики одним RPC-вызовом."""
+    try:
+        result = _db().rpc("dashboard_stats", {}).execute()
+        if result.data:
+            return result.data
+    except Exception as e:
+        print(f"[dashboard_stats] RPC error: {e}")
+
+    # Fallback на прямые запросы
+    return {
+        "total_clients": 0, "active_clients": 0, "blocked_clients": 0,
+        "total_relays": 0, "active_relays": 0, "ip_bans": 0,
+    }
+
+
 def create_client_record(label: str = "", note: str = "") -> dict:
     token = uuid.uuid4().hex[:16]
     data = {"token": token, "label": label, "note": note}
@@ -85,21 +102,19 @@ def list_clients(include_blocked: bool = True) -> list[dict]:
 
 
 def count_clients_on_ip(ip: str, exclude_client_id: int | None = None) -> int:
-    """
-    Сколько ДРУГИХ незаблокированных клиентов сидят на этом IP.
-    Используется для защиты от удаления общего IP.
-    """
+    """Через RPC — один запрос вместо select count=exact."""
     ip_h = hash_ip(ip)
-    query = (
-        _db().table("clients")
-        .select("id", count="exact")
-        .eq("current_ip_hash", ip_h)
-        .eq("is_blocked", False)
-    )
-    if exclude_client_id is not None:
-        query = query.neq("id", exclude_client_id)
-    result = query.execute()
-    return result.count or 0
+    try:
+        result = _db().rpc(
+            "count_clients_on_ip",
+            {"p_ip_hash": ip_h, "p_exclude_client_id": exclude_client_id},
+        ).execute()
+        if result.data is not None:
+            return int(result.data) if not isinstance(result.data, list) else int(result.data or 0)
+        return 0
+    except Exception as e:
+        print(f"[count_clients_on_ip] RPC error: {e}")
+        return 0
 
 
 def activate_client(token: str, new_ip: str, user_agent: str = "") -> dict:
@@ -318,48 +333,29 @@ def _decrypt_client(row: dict) -> dict:
 
 def search_clients_by_ip(ip: str, include_log_history: bool = True) -> list[dict]:
     """
-    Найти клиентов:
-      - current_ip == ip
-      - previous_ip == ip
-      - (опц.) был такой IP в activation_log
-    
-    Один запрос на каждый источник, потом UNION в Python (Supabase JS SDK не умеет UNION).
+    Поиск клиентов по IP через RPC `find_clients_by_ip`.
+    Один SQL вместо 3-4 отдельных запросов.
     """
     ip_h = hash_ip(ip)
-    found_ids: set[int] = set()
-    rows: list[dict] = []
 
-    # 1. По current_ip
-    r1 = _db().table("clients").select("*").eq("current_ip_hash", ip_h).execute()
-    for row in r1.data or []:
-        if row["id"] not in found_ids:
-            found_ids.add(row["id"])
-            rows.append(row)
+    try:
+        result = _db().rpc(
+            "find_clients_by_ip",
+            {"p_ip_hash": ip_h, "p_include_log_history": include_log_history},
+        ).execute()
+    except Exception as e:
+        print(f"[search_clients_by_ip] RPC error: {e}")
+        return []
 
-    # 2. По previous_ip
-    r2 = _db().table("clients").select("*").eq("previous_ip_hash", ip_h).execute()
-    for row in r2.data or []:
-        if row["id"] not in found_ids:
-            found_ids.add(row["id"])
-            rows.append(row)
+    rows = result.data or []
+    clients = []
+    for row in rows:
+        match_source = row.pop("match_source", None)
+        client = _decrypt_client(row)
+        client["match_source"] = match_source
+        clients.append(client)
 
-    # 3. По логам — берём DISTINCT client_id из activation_log с этим ip_hash
-    if include_log_history:
-        r3 = (
-            _db().table("activation_log")
-            .select("client_id")
-            .eq("ip_hash", ip_h)
-            .execute()
-        )
-        log_client_ids = {r["client_id"] for r in (r3.data or [])} - found_ids
-        if log_client_ids:
-            r4 = _db().table("clients").select("*").in_("id", list(log_client_ids)).execute()
-            for row in r4.data or []:
-                if row["id"] not in found_ids:
-                    found_ids.add(row["id"])
-                    rows.append(row)
-
-    return [_decrypt_client(r) for r in rows]
+    return clients
 
 
 # ═══════════════════════════════════════
