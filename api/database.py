@@ -251,6 +251,17 @@ def delete_client(client_id: int) -> Optional[dict]:
     return client
 
 
+def delete_activation_logs(client_id: int) -> int:
+    """Удаляет все логи активаций клиента. Возвращает количество удалённых записей."""
+    result = (
+        _db().table("activation_log")
+        .delete()
+        .eq("client_id", client_id)
+        .execute()
+    )
+    return len(result.data or [])
+
+
 def get_activation_logs(client_id: int, limit: int = 50) -> list[dict]:
     result = (
         _db().table("activation_log")

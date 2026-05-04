@@ -27,7 +27,7 @@ from .database import (
     create_client_record, get_client_by_token, get_client_by_id,
     list_clients, activate_client, activate_client_by_id,
     block_client, delete_client,
-    get_activation_logs, get_all_active_ips,
+    get_activation_logs, delete_activation_logs, get_all_active_ips,
     count_clients_on_ip,
     add_relay, list_relays, get_active_relays, delete_relay, toggle_relay,
     add_ip_ban, remove_ip_ban, remove_ip_ban_by_ip, list_ip_bans,
@@ -337,6 +337,15 @@ async def api_client_logs(client_id: int, limit: int = 50):
         raise HTTPException(404, "Client not found")
     logs = get_activation_logs(client_id, limit)
     return {"client_id": client_id, "label": client["label"], "logs": logs}
+
+@app.delete("/api/clients/{client_id}/logs", dependencies=[Depends(require_api_key)])
+async def api_delete_client_logs(client_id: int):
+    client = get_client_by_id(client_id)
+    if not client:
+        raise HTTPException(404, "Client not found")
+    deleted = delete_activation_logs(client_id)
+    logger.info("Deleted %d activation logs for client #%d", deleted, client_id)
+    return {"deleted": deleted, "client_id": client_id}
 
 @app.get("/api/clients/{client_id}/traffic", dependencies=[Depends(require_api_key)])
 async def api_client_traffic(client_id: int):
