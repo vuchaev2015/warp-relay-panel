@@ -50,6 +50,23 @@ def _fetch_all_paginated(query_builder_fn) -> list:
 # CLIENTS
 # ═══════════════════════════════════════
 
+
+def get_dashboard_stats() -> dict:
+    """Все счётчики одним RPC-вызовом."""
+    try:
+        result = _db().rpc("dashboard_stats", {}).execute()
+        if result.data:
+            return result.data
+    except Exception as e:
+        print(f"[dashboard_stats] RPC error: {e}")
+
+    # Fallback на прямые запросы
+    return {
+        "total_clients": 0, "active_clients": 0, "blocked_clients": 0,
+        "total_relays": 0, "active_relays": 0, "ip_bans": 0,
+    }
+
+
 def create_client_record(label: str = "", note: str = "") -> dict:
     token = uuid.uuid4().hex[:16]
     data = {"token": token, "label": label, "note": note}
@@ -85,21 +102,19 @@ def list_clients(include_blocked: bool = True) -> list[dict]:
 
 
 def count_clients_on_ip(ip: str, exclude_client_id: int | None = None) -> int:
-    """
-    Сколько ДРУГИХ незаблокированных клиентов сидят на этом IP.
-    Используется для защиты от удаления общего IP.
-    """
+    """Через RPC — один запрос вместо select count=exact."""
     ip_h = hash_ip(ip)
-    query = (
-        _db().table("clients")
-        .select("id", count="exact")
-        .eq("current_ip_hash", ip_h)
-        .eq("is_blocked", False)
-    )
-    if exclude_client_id is not None:
-        query = query.neq("id", exclude_client_id)
-    result = query.execute()
-    return result.count or 0
+    try:
+        result = _db().rpc(
+            "count_clients_on_ip",
+            {"p_ip_hash": ip_h, "p_exclude_client_id": exclude_client_id},
+        ).execute()
+        if result.data is not None:
+            return int(result.data) if not isinstance(result.data, list) else int(result.data or 0)
+        return 0
+    except Exception as e:
+        print(f"[count_clients_on_ip] RPC error: {e}")
+        return 0
 
 
 def activate_client(token: str, new_ip: str, user_agent: str = "") -> dict:
@@ -137,6 +152,7 @@ def activate_client(token: str, new_ip: str, user_agent: str = "") -> dict:
     now = datetime.now(timezone.utc).isoformat()
     update_data = {
         "previous_ip_enc": client["_raw_current_ip_enc"],
+        "previous_ip_hash": client.get("_raw_current_ip_hash"),
         "current_ip_enc": encrypt_ip(new_ip),
         "current_ip_hash": hash_ip(new_ip),
         "last_activated_at": now,
@@ -148,6 +164,7 @@ def activate_client(token: str, new_ip: str, user_agent: str = "") -> dict:
     _db().table("activation_log").insert({
         "client_id": client["id"],
         "ip_enc": encrypt_ip(new_ip),
+        "ip_hash": hash_ip(new_ip),  # ← новое
         "user_agent": user_agent[:500] if user_agent else None,
     }).execute()
 
@@ -195,6 +212,7 @@ def activate_client_by_id(client_id: int, new_ip: str) -> dict:
     now = datetime.now(timezone.utc).isoformat()
     update_data = {
         "previous_ip_enc": client["_raw_current_ip_enc"],
+        "previous_ip_hash": client.get("_raw_current_ip_hash"),
         "current_ip_enc": encrypt_ip(new_ip),
         "current_ip_hash": hash_ip(new_ip),
         "last_activated_at": now,
@@ -218,8 +236,10 @@ def activate_client_by_id(client_id: int, new_ip: str) -> dict:
     }
 
 
-def block_client(client_id: int, blocked: bool = True):
+def block_client(client_id: int, blocked: bool = True) -> Optional[dict]:
+    """Возвращает обновлённый клиент (decrypted)."""
     _db().table("clients").update({"is_blocked": blocked}).eq("id", client_id).execute()
+    return get_client_by_id(client_id)
 
 
 def delete_client(client_id: int) -> Optional[dict]:
@@ -307,7 +327,35 @@ def _decrypt_client(row: dict) -> dict:
         "_activations_today": row["activations_today"],
         "_reset_date": row.get("activations_reset_date"),
         "_raw_current_ip_enc": row.get("current_ip_enc"),
+        "_raw_current_ip_hash": row.get("current_ip_hash"),
     }
+
+
+def search_clients_by_ip(ip: str, include_log_history: bool = True) -> list[dict]:
+    """
+    Поиск клиентов по IP через RPC `find_clients_by_ip`.
+    Один SQL вместо 3-4 отдельных запросов.
+    """
+    ip_h = hash_ip(ip)
+
+    try:
+        result = _db().rpc(
+            "find_clients_by_ip",
+            {"p_ip_hash": ip_h, "p_include_log_history": include_log_history},
+        ).execute()
+    except Exception as e:
+        print(f"[search_clients_by_ip] RPC error: {e}")
+        return []
+
+    rows = result.data or []
+    clients = []
+    for row in rows:
+        match_source = row.pop("match_source", None)
+        client = _decrypt_client(row)
+        client["match_source"] = match_source
+        clients.append(client)
+
+    return clients
 
 
 # ═══════════════════════════════════════
@@ -380,8 +428,23 @@ def get_ip_ban(ip: str) -> Optional[dict]:
     }
 
 
+def get_ip_ban_by_id(ban_id: int) -> Optional[dict]:
+    result = _db().table("ip_blacklist").select("*").eq("id", ban_id).execute()
+    if not result.data:
+        return None
+    row = result.data[0]
+    try:
+        ip = decrypt_ip(row["ip_enc"])
+    except Exception:
+        ip = "decrypt_error"
+    return {
+        "id": row["id"], "ip": ip,
+        "reason": row["reason"], "created_at": row["created_at"],
+    }
+
+
 def list_ip_bans() -> list[dict]:
-    """Список ВСЕХ забаненных IP с пагинацией."""
+    """Список ВСЕХ забаненных IP с пагинацией (для внутренних нужд: full_sync, stats)."""
     def _build(offset: int, limit: int):
         return (
             _db().table("ip_blacklist")
@@ -406,6 +469,52 @@ def list_ip_bans() -> list[dict]:
     return bans
 
 
+def list_ip_bans_paginated(
+    page: int = 0,
+    per_page: int = 20,
+    search: str | None = None,
+) -> dict:
+    """
+    Серверная пагинация блэклиста.
+    search — поиск по hash (точное совпадение IP).
+    Возвращает {items, total, page, per_page, total_pages}.
+    """
+    query = _db().table("ip_blacklist").select("*", count="exact")
+
+    if search and search.strip():
+        ip_h = hash_ip(search.strip())
+        query = query.eq("ip_hash", ip_h)
+
+    offset = page * per_page
+    result = (
+        query.order("created_at", desc=True)
+        .range(offset, offset + per_page - 1)
+        .execute()
+    )
+
+    items = []
+    for row in result.data or []:
+        try:
+            ip = decrypt_ip(row["ip_enc"])
+        except Exception:
+            ip = "decrypt_error"
+        items.append({
+            "id": row["id"],
+            "ip": ip,
+            "reason": row["reason"],
+            "created_at": row["created_at"],
+        })
+
+    total = result.count or 0
+    return {
+        "items": items,
+        "total": total,
+        "page": page,
+        "per_page": per_page,
+        "total_pages": max(1, (total + per_page - 1) // per_page),
+    }
+
+
 # ═══════════════════════════════════════
 # RELAYS
 # ═══════════════════════════════════════
@@ -420,8 +529,16 @@ def add_relay(name: str, host: str, agent_port: int = 7580,
     return result.data[0]
 
 
-def list_relays() -> list[dict]:
-    result = _db().table("relays").select("*").order("id").execute()
+def list_relays(fields: str = "full") -> list[dict]:
+    """
+    fields='full' — все колонки (по умолчанию)
+    fields='basic' — только id, name, host, agent_port, is_active, is_synced
+    """
+    if fields == "basic":
+        cols = "id,name,host,agent_port,is_active,is_synced,last_health_at"
+    else:
+        cols = "*"
+    result = _db().table("relays").select(cols).order("id").execute()
     return result.data
 
 
@@ -440,8 +557,11 @@ def delete_relay(relay_id: int) -> bool:
     return len(result.data) > 0
 
 
-def toggle_relay(relay_id: int, active: bool):
+def toggle_relay(relay_id: int, active: bool) -> Optional[dict]:
+    """Возвращает обновлённый relay."""
     _db().table("relays").update({"is_active": active}).eq("id", relay_id).execute()
+    result = _db().table("relays").select("*").eq("id", relay_id).execute()
+    return result.data[0] if result.data else None
 
 
 def mark_relay_synced(relay_id: int, synced: bool):

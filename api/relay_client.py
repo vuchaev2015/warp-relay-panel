@@ -189,9 +189,35 @@ async def get_relay_stats(relay: dict) -> dict:
     return {"ok": ok, **data}
 
 
-async def get_relay_traffic(relay: dict, client_ip: str | None = None) -> dict:
+async def get_relay_traffic(
+    relay: dict,
+    client_ip: str | None = None,
+    summary: bool = False,
+    top: int | None = None,
+) -> dict:
+    """
+    summary=True → вернуть только totals без ips dict
+    top=N → вернуть только N топ-IP по total_bytes
+    """
     path = f"/traffic/{client_ip}" if client_ip else "/traffic"
     ok, data = await _agent_request(relay, "GET", path)
+    
+    if not ok or client_ip:
+        return {"ok": ok, "relay": relay["name"], **data}
+
+    # Серверная фильтрация (на стороне API, т.к. агент пока не принимает params)
+    if summary:
+        data.pop("ips", None)
+    elif top is not None and "ips" in data:
+        sorted_ips = sorted(
+            data["ips"].items(),
+            key=lambda x: x[1].get("total_bytes", 0),
+            reverse=True
+        )[:top]
+        data["ips"] = dict(sorted_ips)
+        data["truncated"] = True
+        data["top_n"] = top
+
     return {"ok": ok, "relay": relay["name"], **data}
 
 
